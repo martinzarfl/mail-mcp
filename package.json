@@ -1,0 +1,56 @@
+{
+  "name": "@martinzarfl/mail-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server for SMTP and IMAP based email handling",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mail-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "watch": "tsc --watch",
+    "dev": "node --enable-source-maps dist/index.js",
+    "dev:env": "env $(cat .env | xargs) node --enable-source-maps dist/index.js",
+    "dev:sse": "TRANSPORT=sse node --enable-source-maps dist/index.js",
+    "dev:sse:env": "TRANSPORT=sse env $(cat .env | xargs) node --enable-source-maps dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "email",
+    "smtp",
+    "mail",
+    "model-context-protocol"
+  ],
+  "author": "Martin Zarfl",
+  "license": "MIT",
+  "engines": {
+    "node": ">=23.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "express": "^5.1.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.7.1",
+    "nodemailer": "^6.9.15",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.4",
+    "@types/imap": "^0.8.40",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^22.10.5",
+    "@types/nodemailer": "^6.4.17",
+    "typescript": "^5.7.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martinzarfl/mail-mcp.git"
+  },
+  "types": "./dist/index.d.ts",
+  "bugs": {
+    "url": "https://github.com/martinzarfl/mail-mcp/issues"
+  },
+  "homepage": "https://github.com/martinzarfl/mail-mcp#readme"
+}
