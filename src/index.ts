@@ -9,6 +9,7 @@ import {
   ListPromptsResultSchema,
   ListResourcesRequestSchema,
   ListResourcesResultSchema,
+  ListResourceTemplatesRequestSchema,
   ListResourceTemplatesResultSchema,
   ListToolsRequestSchema,
   Tool,
@@ -1297,9 +1298,14 @@ const server = new Server(
   }
 );
 
-// List available ressources
+// List available resources
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
   return { resources: [] }
+})
+
+// List available resource templates
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+  return { resourceTemplates: [] }
 })
 
 // List available prompts
