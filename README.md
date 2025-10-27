@@ -119,8 +119,8 @@ Add to your Claude Desktop configuration file:
 {
   "mcpServers": {
     "mail": {
-      "command": "node",
-      "args": ["/absolute/path/to/mail-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "martinzarfl/mail-mcp"],
       "env": {
         "SMTP_HOST": "smtp.provider.com",
         "SMTP_PORT": "587",
