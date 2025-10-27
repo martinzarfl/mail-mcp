@@ -199,7 +199,8 @@ const fetchEmails = async (
   mailbox: string,
   limit: number,
   unseen?: boolean,
-  since?: string
+  since?: string,
+  html?: boolean,
 ): Promise<any[]> => {
   const imap = await createImapConnection();
 
@@ -326,7 +327,7 @@ const fetchEmails = async (
                 subject: parsed.subject || "",
                 date: parsed.date?.toISOString() || "",
                 text: parsed.text || "",
-                html: parsed.html || "",
+                html: html ? parsed.html || "" : "",
                 flags: attributes?.flags || [],
                 attachments: parsed.attachments?.map((att) => ({
                   filename: att.filename,
