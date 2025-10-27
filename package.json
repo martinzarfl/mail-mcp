@@ -1,6 +1,6 @@
 {
   "name": "@martinzarfl/mail-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP Server for SMTP and IMAP based email handling",
   "type": "module",
   "main": "dist/index.js",
