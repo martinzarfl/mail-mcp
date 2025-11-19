@@ -5,22 +5,71 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
   CallToolRequestSchema,
+  isInitializeRequest,
   ListPromptsRequestSchema,
-  ListPromptsResultSchema,
   ListResourcesRequestSchema,
-  ListResourcesResultSchema,
   ListResourceTemplatesRequestSchema,
-  ListResourceTemplatesResultSchema,
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import nodemailer from "nodemailer";
 import Imap from "imap";
+import cors from "cors";
 import { simpleParser } from "mailparser";
 import { z } from "zod";
-import http from "http";
 import express from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { getOAuthProtectedResourceMetadataUrl, mcpAuthMetadataRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { randomUUID } from "crypto";
+
+const CONFIG = {
+  host: process.env.HOST || "localhost",
+  port: Number(process.env.PORT) || 3000,
+  auth: {
+    host: process.env.AUTH_HOST || process.env.HOST || "localhost",
+    port: Number(process.env.AUTH_PORT) || 8080,
+    realm: process.env.AUTH_REALM || "mcp",
+    clientId: process.env.OAUTH_CLIENT_ID || "mail-mcp",
+    clientSecret: process.env.OAUTH_CLIENT_SECRET || "",
+  },
+};
+
+function createOAuthUrls() {
+  const authBaseUrl = new URL(
+    `http://${CONFIG.auth.host}:${CONFIG.auth.port}/realms/${CONFIG.auth.realm}/`
+  );
+  return {
+    issuer: authBaseUrl.toString(),
+    introspection_endpoint: new URL(
+      "protocol/openid-connect/token/introspect",
+      authBaseUrl
+    ).toString(),
+    authorization_endpoint: new URL(
+      "protocol/openid-connect/auth",
+      authBaseUrl
+    ).toString(),
+    token_endpoint: new URL(
+      "protocol/openid-connect/token",
+      authBaseUrl
+    ).toString(),
+  };
+}
+
+function createRequestLogger() {
+  return (req: any, res: any, next: any) => {
+    const start = Date.now();
+    res.on("finish", () => {
+      const ms = Date.now() - start;
+      console.log(
+        `${req.method} ${req.originalUrl} -> ${res.statusCode} ${ms}ms`
+      );
+    });
+    next();
+  };
+}
 
 // Zod schemas for validation
 const SendEmailSchema = z.object({
@@ -141,12 +190,20 @@ if (missingVars.length > 0) {
   console.error("  SMTP_USER - SMTP authentication username");
   console.error("  SMTP_PASS - SMTP authentication password");
   console.error("  SMTP_FROM - (Optional) Default sender email address");
-  console.error("  SMTP_SECURE - (Optional) Use TLS (true/false, default: true for port 465)");
+  console.error(
+    "  SMTP_SECURE - (Optional) Use TLS (true/false, default: true for port 465)"
+  );
   console.error("\nFor IMAP (reading emails):");
-  console.error("  IMAP_HOST - IMAP server hostname (optional, defaults to SMTP_HOST)");
+  console.error(
+    "  IMAP_HOST - IMAP server hostname (optional, defaults to SMTP_HOST)"
+  );
   console.error("  IMAP_PORT - IMAP server port (optional, defaults to 993)");
-  console.error("  IMAP_USER - IMAP authentication username (optional, defaults to SMTP_USER)");
-  console.error("  IMAP_PASS - IMAP authentication password (optional, defaults to SMTP_PASS)");
+  console.error(
+    "  IMAP_USER - IMAP authentication username (optional, defaults to SMTP_USER)"
+  );
+  console.error(
+    "  IMAP_PASS - IMAP authentication password (optional, defaults to SMTP_PASS)"
+  );
   console.error("  IMAP_TLS - Use TLS (optional, default: true)");
   process.exit(1);
 }
@@ -201,7 +258,7 @@ const fetchEmails = async (
   limit: number,
   unseen?: boolean,
   since?: string,
-  html?: boolean,
+  html?: boolean
 ): Promise<any[]> => {
   const imap = await createImapConnection();
 
@@ -212,7 +269,9 @@ const fetchEmails = async (
         return reject(err);
       }
 
-      console.error(`Opened mailbox: ${mailbox}, Total messages: ${box.messages.total}`);
+      console.error(
+        `Opened mailbox: ${mailbox}, Total messages: ${box.messages.total}`
+      );
 
       const searchCriteria: any[] = [];
 
@@ -230,18 +289,29 @@ const fetchEmails = async (
       console.error(`Search criteria: ${JSON.stringify(searchCriteria)}`);
 
       // Progressive search: start with last month, expand if needed
-      const searchWithTimeWindow = async (monthsBack: number): Promise<number[]> => {
+      const searchWithTimeWindow = async (
+        monthsBack: number
+      ): Promise<number[]> => {
         return new Promise((resolveSearch, rejectSearch) => {
           const timeWindowCriteria = [...searchCriteria];
 
           // Add time constraint if not already specified
-          if (!since && !timeWindowCriteria.some(c => Array.isArray(c) && c[0] === 'SINCE')) {
+          if (
+            !since &&
+            !timeWindowCriteria.some(
+              (c) => Array.isArray(c) && c[0] === "SINCE"
+            )
+          ) {
             const sinceDate = new Date();
             sinceDate.setMonth(sinceDate.getMonth() - monthsBack);
-            timeWindowCriteria.push(['SINCE', sinceDate]);
+            timeWindowCriteria.push(["SINCE", sinceDate]);
           }
 
-          console.error(`Searching with ${monthsBack} month(s) back: ${JSON.stringify(timeWindowCriteria)}`);
+          console.error(
+            `Searching with ${monthsBack} month(s) back: ${JSON.stringify(
+              timeWindowCriteria
+            )}`
+          );
 
           imap.search(timeWindowCriteria, (err, results) => {
             if (err) return rejectSearch(err);
@@ -258,7 +328,9 @@ const fetchEmails = async (
 
         while (results.length < limit && monthsBack <= maxMonthsBack) {
           results = await searchWithTimeWindow(monthsBack);
-          console.error(`Found ${results.length} messages in last ${monthsBack} month(s)`);
+          console.error(
+            `Found ${results.length} messages in last ${monthsBack} month(s)`
+          );
 
           if (results.length >= limit) {
             break;
@@ -276,107 +348,124 @@ const fetchEmails = async (
         return results;
       };
 
-      findEmails().then(results => {
-        console.error(`Final search found ${results.length} messages matching criteria`);
+      findEmails()
+        .then((results) => {
+          console.error(
+            `Final search found ${results.length} messages matching criteria`
+          );
 
-        if (!results || results.length === 0) {
-          imap.end();
-          return resolve([]);
-        }
+          if (!results || results.length === 0) {
+            imap.end();
+            return resolve([]);
+          }
 
-        // Get the most recent emails by taking from the end
-        // IMAP search returns results in ascending order (oldest first)
-        // We want the LAST N emails (most recent)
-        const uids = results.slice(-limit);
-        console.error(`Fetching last ${uids.length} messages from ${results.length} total`);
-        console.error(`UIDs being fetched: ${uids.join(", ")}`);
-        console.error(`First UID: ${results[0]}, Last UID: ${results[results.length - 1]}`);
+          // Get the most recent emails by taking from the end
+          // IMAP search returns results in ascending order (oldest first)
+          // We want the LAST N emails (most recent)
+          const uids = results.slice(-limit);
+          console.error(
+            `Fetching last ${uids.length} messages from ${results.length} total`
+          );
+          console.error(`UIDs being fetched: ${uids.join(", ")}`);
+          console.error(
+            `First UID: ${results[0]}, Last UID: ${results[results.length - 1]}`
+          );
 
-        const fetch = imap.fetch(uids, {
-          bodies: "",
-          struct: true,
-          markSeen: false,
-        });
-
-        let messageCount = 0;
-        let messagesReceived = 0;
-        const parsedEmails: Map<number, any> = new Map();
-
-        fetch.on("message", (msg, seqno) => {
-          messageCount++;
-          let buffer = "";
-          let attributes: any = null;
-
-          msg.on("attributes", (attrs) => {
-            attributes = attrs;
+          const fetch = imap.fetch(uids, {
+            bodies: "",
+            struct: true,
+            markSeen: false,
           });
 
-          msg.on("body", (stream) => {
-            stream.on("data", (chunk) => {
-              buffer += chunk.toString("utf8");
+          let messageCount = 0;
+          let messagesReceived = 0;
+          const parsedEmails: Map<number, any> = new Map();
+
+          fetch.on("message", (msg, seqno) => {
+            messageCount++;
+            let buffer = "";
+            let attributes: any = null;
+
+            msg.on("attributes", (attrs) => {
+              attributes = attrs;
+            });
+
+            msg.on("body", (stream) => {
+              stream.on("data", (chunk) => {
+                buffer += chunk.toString("utf8");
+              });
+            });
+
+            msg.once("end", async () => {
+              try {
+                const parsed = await simpleParser(buffer);
+                const email = {
+                  uid: attributes?.uid || seqno,
+                  seqno: seqno,
+                  from: getAddressText(parsed.from),
+                  to: getAddressText(parsed.to),
+                  subject: parsed.subject || "",
+                  date: parsed.date?.toISOString() || "",
+                  text: parsed.text || "",
+                  html: html ? parsed.html || "" : "",
+                  flags: attributes?.flags || [],
+                  attachments:
+                    parsed.attachments?.map((att) => ({
+                      filename: att.filename,
+                      contentType: att.contentType,
+                      size: att.size,
+                    })) || [],
+                };
+                parsedEmails.set(seqno, email);
+                console.error(
+                  `Parsed email ${email.seqno}: "${email.subject}" from ${email.from} (${email.date})`
+                );
+              } catch (e) {
+                console.error("Error parsing email:", e);
+              } finally {
+                messagesReceived++;
+                // Check if all messages have been parsed
+                if (messagesReceived === messageCount && fetchEnded) {
+                  finishFetch();
+                }
+              }
             });
           });
 
-          msg.once("end", async () => {
-            try {
-              const parsed = await simpleParser(buffer);
-              const email = {
-                uid: attributes?.uid || seqno,
-                seqno: seqno,
-                from: getAddressText(parsed.from),
-                to: getAddressText(parsed.to),
-                subject: parsed.subject || "",
-                date: parsed.date?.toISOString() || "",
-                text: parsed.text || "",
-                html: html ? parsed.html || "" : "",
-                flags: attributes?.flags || [],
-                attachments: parsed.attachments?.map((att) => ({
-                  filename: att.filename,
-                  contentType: att.contentType,
-                  size: att.size,
-                })) || [],
-              };
-              parsedEmails.set(seqno, email);
-              console.error(`Parsed email ${email.seqno}: "${email.subject}" from ${email.from} (${email.date})`);
-            } catch (e) {
-              console.error("Error parsing email:", e);
-            } finally {
-              messagesReceived++;
-              // Check if all messages have been parsed
-              if (messagesReceived === messageCount && fetchEnded) {
-                finishFetch();
-              }
+          let fetchEnded = false;
+          const finishFetch = () => {
+            imap.end();
+            // Convert map to array and sort by date descending (most recent first)
+            const emailArray = Array.from(parsedEmails.values());
+            emailArray.sort(
+              (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+            );
+            console.error(
+              `Successfully fetched ${emailArray.length} emails (${messageCount} total messages)`
+            );
+            resolve(emailArray);
+          };
+
+          fetch.once("error", (err) => {
+            imap.end();
+            reject(err);
+          });
+
+          fetch.once("end", () => {
+            fetchEnded = true;
+            console.error(
+              `Fetch ended. Received ${messagesReceived}/${messageCount} messages so far`
+            );
+            // Only finish if all messages have been parsed
+            if (messagesReceived === messageCount) {
+              finishFetch();
             }
           });
-        });
-
-        let fetchEnded = false;
-        const finishFetch = () => {
-          imap.end();
-          // Convert map to array and sort by date descending (most recent first)
-          const emailArray = Array.from(parsedEmails.values());
-          emailArray.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-          console.error(`Successfully fetched ${emailArray.length} emails (${messageCount} total messages)`);
-          resolve(emailArray);
-        };
-
-        fetch.once("error", (err) => {
+        })
+        .catch((err) => {
           imap.end();
           reject(err);
         });
-
-        fetch.once("end", () => {
-          fetchEnded = true;
-          console.error(`Fetch ended. Received ${messagesReceived}/${messageCount} messages so far`);
-          // Only finish if all messages have been parsed
-          if (messagesReceived === messageCount) {
-            finishFetch();
-          }
-        });
-      }).catch(err => {
-        imap.end();
-        reject(err);
-      });
     });
   });
 };
@@ -433,7 +522,8 @@ const markEmail = async (
         unflagged: "\\Flagged",
       };
 
-      const action = flag === "unread" || flag === "unflagged" ? "delFlags" : "addFlags";
+      const action =
+        flag === "unread" || flag === "unflagged" ? "delFlags" : "addFlags";
       const imapFlag = flagMap[flag];
 
       imap[action](uid, [imapFlag], (err) => {
@@ -616,11 +706,12 @@ const advancedSearch = async (
                 date: parsed.date?.toISOString() || "",
                 text: parsed.text || "",
                 html: parsed.html || "",
-                attachments: parsed.attachments?.map((att) => ({
-                  filename: att.filename,
-                  contentType: att.contentType,
-                  size: att.size,
-                })) || [],
+                attachments:
+                  parsed.attachments?.map((att) => ({
+                    filename: att.filename,
+                    contentType: att.contentType,
+                    size: att.size,
+                  })) || [],
               };
               parsedEmails.set(seqno, email);
             } catch (e) {
@@ -747,15 +838,21 @@ const getThread = async (
               if (parsed.messageId) relatedIds.add(parsed.messageId);
               if (parsed.inReplyTo) relatedIds.add(parsed.inReplyTo);
               if (parsed.references) {
-                const refs = Array.isArray(parsed.references) ? parsed.references.join(" ") : parsed.references;
-                refs.split(/\s+/).forEach((ref: string) => relatedIds.add(ref.trim()));
+                const refs = Array.isArray(parsed.references)
+                  ? parsed.references.join(" ")
+                  : parsed.references;
+                refs
+                  .split(/\s+/)
+                  .forEach((ref: string) => relatedIds.add(ref.trim()));
               }
 
               const email = {
                 uid: seqno,
                 messageId: parsed.messageId || "",
                 inReplyTo: parsed.inReplyTo || "",
-                references: Array.isArray(parsed.references) ? parsed.references.join(" ") : (parsed.references || ""),
+                references: Array.isArray(parsed.references)
+                  ? parsed.references.join(" ")
+                  : parsed.references || "",
                 from: getAddressText(parsed.from),
                 to: getAddressText(parsed.to),
                 subject: parsed.subject || "",
@@ -780,7 +877,10 @@ const getThread = async (
           // Simplified: just return what we have, sorted by date
           imap.end();
           const emailArray = Array.from(parsedEmails.values());
-          emailArray.sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime());
+          emailArray.sort(
+            (a: any, b: any) =>
+              new Date(a.date).getTime() - new Date(b.date).getTime()
+          );
           resolve(emailArray);
         };
 
@@ -840,7 +940,9 @@ const downloadAttachment = async (
 
             if (attachmentIndex >= parsed.attachments.length) {
               imap.end();
-              return reject(new Error(`Attachment index ${attachmentIndex} out of range`));
+              return reject(
+                new Error(`Attachment index ${attachmentIndex} out of range`)
+              );
             }
 
             const attachment = parsed.attachments[attachmentIndex];
@@ -918,7 +1020,8 @@ const tools: Tool[] = [
               },
               content: {
                 type: "string",
-                description: "Attachment content (base64 encoded or plain text)",
+                description:
+                  "Attachment content (base64 encoded or plain text)",
               },
               encoding: {
                 type: "string",
@@ -984,8 +1087,7 @@ const tools: Tool[] = [
   },
   {
     name: "list_mailboxes",
-    description:
-      "List all available mailboxes/folders in the IMAP account.",
+    description: "List all available mailboxes/folders in the IMAP account.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -1293,25 +1395,25 @@ const server = new Server(
     capabilities: {
       tools: {},
       prompts: {},
-      resources: {}
+      resources: {},
     },
   }
 );
 
 // List available resources
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  return { resources: [] }
-})
+  return { resources: [] };
+});
 
 // List available resource templates
 server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-  return { resourceTemplates: [] }
-})
+  return { resourceTemplates: [] };
+});
 
 // List available prompts
 server.setRequestHandler(ListPromptsRequestSchema, async () => {
-  return { prompts: [] }
-})
+  return { prompts: [] };
+});
 
 // List available tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -1386,7 +1488,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(
                 {
                   success: true,
-                  message: "SMTP connection and authentication verified successfully",
+                  message:
+                    "SMTP connection and authentication verified successfully",
                   host: process.env.SMTP_HOST,
                   port: process.env.SMTP_PORT,
                   user: process.env.SMTP_USER,
@@ -1792,7 +1895,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: "text",
-          text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          text: `Error: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
         },
       ],
       isError: true,
@@ -1808,56 +1913,224 @@ async function main() {
     // SSE transport
     const port = parseInt(process.env.PORT || "3001");
     const path = process.env.SSE_PATH || "/sse";
-    const app = express()
-    app.use(express.json());
+    const app = express();
+    app.use(
+      express.json({
+        verify: (req: any, _res, buf) => {
+          req.rawBody = buf?.toString() ?? "";
+        },
+      })
+    );
+
+    app.use(
+      cors({
+        origin: "*",
+        exposedHeaders: ["Mcp-Session-Id"],
+      })
+    );
+
+    app.use(createRequestLogger());
+
+    const mcpServerUrl = new URL(`http://${CONFIG.host}:${CONFIG.port}/mcp`);
+    const oauthUrls = createOAuthUrls();
+
+    const oauthMetadata: OAuthMetadata = {
+      ...oauthUrls,
+      response_types_supported: ["code"],
+    };
+
+    const tokenVerifier = {
+      verifyAccessToken: async (token: string) => {
+        const endpoint = oauthMetadata.introspection_endpoint;
+
+        if (!endpoint) {
+          console.error("[auth] no introspection endpoint in metadata");
+          throw new Error(
+            "No token verification endpoint available in metadata"
+          );
+        }
+
+        const params = new URLSearchParams({
+          token: token,
+          client_id: CONFIG.auth.clientId,
+        });
+
+        if (CONFIG.auth.clientSecret) {
+          params.set("client_secret", CONFIG.auth.clientSecret);
+        }
+        let response: Response;
+        try {
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: params.toString(),
+          });
+        } catch (e) {
+          console.error("[auth] introspection fetch threw", e);
+          throw e;
+        }
+
+        if (!response.ok) {
+          const txt = await response.text();
+          console.error("[auth] introspection non-OK", {
+            status: response.status,
+          });
+
+          try {
+            const obj = JSON.parse(txt);
+          } catch {
+            console.error(txt);
+          }
+          throw new Error(`Invalid or expired token: ${txt}`);
+        }
+
+        let data: any;
+        try {
+          data = await response.json();
+        } catch (e) {
+          const txt = await response.text();
+          console.error("[auth] failed to parse introspection JSON", {
+            error: String(e),
+            body: txt,
+          });
+          throw e;
+        }
+
+        if (data.active === false) {
+          throw new Error("Inactive token");
+        }
+
+        if (!data.aud) {
+          throw new Error("Resource indicator (aud) missing");
+        }
+
+        const audiences: string[] = Array.isArray(data.aud)
+          ? data.aud
+          : [data.aud];
+        const allowed = audiences.some((a) =>
+          checkResourceAllowed({
+            requestedResource: a,
+            configuredResource: mcpServerUrl,
+          })
+        );
+        if (!allowed) {
+          throw new Error(
+            `None of the provided audiences are allowed. Expected ${mcpServerUrl}, got: ${audiences.join(
+              ", "
+            )}`
+          );
+        }
+
+        return {
+          token,
+          clientId: data.client_id,
+          scopes: data.scope ? data.scope.split(" ") : [],
+          expiresAt: data.exp,
+        };
+      },
+    };
+    app.use(
+      mcpAuthMetadataRouter({
+        oauthMetadata,
+        resourceServerUrl: mcpServerUrl,
+        scopesSupported: ["mcp:tools"],
+        resourceName: "MCP Demo Server",
+      })
+    );
+
+    const authMiddleware = requireBearerAuth({
+      verifier: tokenVerifier,
+      requiredScopes: [],
+      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpServerUrl),
+    });
 
     // Store transports for each session type
     const transports = {
-        streamable: {} as Record<string, StreamableHTTPServerTransport>,
-        sse: {} as Record<string, SSEServerTransport>
+      streamable: {} as Record<string, StreamableHTTPServerTransport>,
+      sse: {} as Record<string, SSEServerTransport>,
     };
 
     // Modern Streamable HTTP endpoint
-    app.post('/mcp', async (req, res) => {
-        // Create a new transport for each request to prevent request ID collisions
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true
-      });
+    const mcpPostHandler = async (req: express.Request, res: express.Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      let transport: StreamableHTTPServerTransport;
 
-      res.on('close', () => {
-          transport.close();
+      if (sessionId && transports.streamable[sessionId]) {
+        transport = transports.streamable[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sessionId) => {
+            transports.streamable[sessionId] = transport;
+          },
+        });
+
+        transport.onclose = () => {
+          if (transport.sessionId) {
+            delete transports.streamable[transport.sessionId];
+          }
+        };
+
+        await server.connect(transport);
+      } else {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Bad Request: No valid session ID provided',
+          },
+          id: null,
+        });
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    };
+
+    const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !transports.streamable[sessionId]) {
+        res.status(400).send('Invalid or missing session ID');
+        return;
+      }
+      
+      const transport = transports.streamable[sessionId];
+      await transport.handleRequest(req, res);
+    };
+
+    app.post("/mcp", authMiddleware, mcpPostHandler);
+    app.get("/mcp",authMiddleware, handleSessionRequest);
+    app.delete("/mcp",authMiddleware, handleSessionRequest);
+    // Legacy SSE endpoint for older clients
+    app.get("/sse", authMiddleware,  async (req, res) => {
+      // Create SSE transport for legacy clients
+      const transport = new SSEServerTransport("/messages", res);
+      transports.sse[transport.sessionId] = transport;
+
+      res.on("close", () => {
+        delete transports.sse[transport.sessionId];
       });
 
       await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    });
-    // Legacy SSE endpoint for older clients
-    app.get('/sse', async (req, res) => {
-        // Create SSE transport for legacy clients
-        const transport = new SSEServerTransport('/messages', res);
-        transports.sse[transport.sessionId] = transport;
-
-        res.on('close', () => {
-            delete transports.sse[transport.sessionId];
-        });
-
-        await server.connect(transport);
     });
 
     // Legacy message endpoint for older clients
-    app.post('/messages', async (req, res) => {
-        const sessionId = req.query.sessionId as string;
-        const transport = transports.sse[sessionId];
-        if (transport) {
-            await transport.handlePostMessage(req, res, req.body);
-        } else {
-            res.status(400).send('No transport found for sessionId');
-        }
+    app.post("/messages", authMiddleware,  async (req, res) => {
+      const sessionId = req.query.sessionId as string;
+      const transport = transports.sse[sessionId];
+      if (transport) {
+        await transport.handlePostMessage(req, res, req.body);
+      } else {
+        res.status(400).send("No transport found for sessionId");
+      }
     });
 
     app.listen(port, () => {
-      console.error(`Mail MCP Server running on SSE at http://localhost:${port}${path}`);
+      console.error(
+        `Mail MCP Server running on SSE at http://localhost:${port}${path}`
+      );
     });
   } else {
     // Stdio transport (default)
